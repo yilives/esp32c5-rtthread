@@ -67,7 +67,7 @@ pinirq  : PASS
 | Temperature sensor (`c5tsens`) | **PASS**, plausible + range register proven effective; **uncalibrated** | §17f |
 | PSRAM (8 MB) | **enabled**, 1 MB read/write byte-exact, in the IDF heap | §17g |
 | LP core (ULP RISC-V) | **runs**, counter + checksum exact at 100/2k/5k/20k loops, restartable | §17h |
-| SoftAP (`c5ap`) | **beaconing**, seen from the host at AA:BB:CC:DD:EE:FF ch=6 WPA2; no client test | §17i |
+| SoftAP (`c5ap`) | **beaconing**, seen from the host at 14:c1:9f:8a:11:39 ch=6 WPA2; no client test | §17i |
 | Pin registry (`c5pins`) | **PASS**, no double claim, no test on a fixed-function pad | §17j |
 | USB Serial/JTAG (`c5usj`) | **device side only**: PHY pads powered, FIFO coherent; no host, so no enumeration | §17l |
 | AHB GDMA (`c5gdma`) | **PASS**: mem-to-mem copy byte-exact at 1/16/128/256 B, no overrun | §17n |
@@ -92,7 +92,7 @@ froze with no error reported anywhere. §14 has the counters that proved it; the
 | Flash | 16 MB, mfr 0x68 device 0x4018 | `esptool flash-id` |
 | PSRAM | 8 MB in-package (the "R8") — **enabled and verified** (§17g) | soc_caps + measured |
 | XTAL | 48 MHz, auto-detected (`CONFIG_XTAL_FREQ_AUTO`) | boot log |
-| MAC | AA:BB:CC:DD:EE:FF (STA), ...:3a (BLE) | `esp_wifi_get_mac` |
+| MAC | 14:c1:9f:8a:11:38 (STA), ...:3a (BLE) | `esp_wifi_get_mac` |
 | ISA | `rv32imac_zicsr_zifencei_zaamo_zalrsc` | `misa` = 0x40103105 |
 | FPU | **none** | §7.1 |
 | Interrupts | CLIC with hardware nesting | `SOC_INT_CLIC_SUPPORTED` |
@@ -233,7 +233,7 @@ the IP layer (DHCP lease), and the socket layer.
 
 ```
 # on the PC, tools/blescan.py while the board runs c5adv 25:
-HIT AA:BB:CC:DD:EE:FF -46 c5-rtt
+HIT 14:C1:9F:8A:11:3A -46 c5-rtt
 RESULT MATCH
 
 # on the PC, tools/blegatt.py:
@@ -1439,14 +1439,14 @@ and on the host, which is associated to a 5 GHz AP 2 m away:
 SSID 6 : c5-rtt-ap
       Authentication          : WPA2-Personal
       Encryption              : CCMP
-      BSSID 1                 : AA:BB:CC:DD:EE:FF
+      BSSID 1                 : 14:c1:9f:8a:11:39
            Signal             : 95%
            Radio type         : 802.11n
            Band               : 2.4 GHz
            Channel            : 6
 ```
 
-That BSSID is the board's own MAC (`AA:BB:CC:DD:EE:FF`) plus one, on the channel
+That BSSID is the board's own MAC (`14:c1:9f:8a:11:38`) plus one, on the channel
 that was programmed. **This is the only check in the whole port that leaves the
 chip**: every other result is the board reporting on itself. A driver that thinks
 it is beaconing and a driver that is beaconing look identical from inside.
@@ -2460,6 +2460,77 @@ not answer it.
 layer is mapped and probed (here), and the LP I2C controller is reachable but does
 not start.** That is the honest boundary.
 
+## 17u. Round 32: ADC voltage conversion — the calibration was already in the image
+
+`c5adc` reported raw codes for thirty rounds because "the calibration coefficients
+come from the ADC calibration component, which is not part of this port". That was
+wrong in a specific way: **the component was already compiled into every image.**
+
+```
+build/esp-idf/esp_adc/libesp_adc.a
+  adc_cali.c.obj  adc_cali_curve_fitting.c.obj  curve_fitting_coefficients.c.obj
+  00000000 T adc_cali_create_scheme_curve_fitting
+```
+
+It was linked and then dropped by `--gc-sections`, because nothing referenced it.
+`nm c5_rtt_full.elf | grep adc_cali` returned nothing while the archive had the
+symbols. That is the same failure this port keeps recording, from a new direction:
+not "the code is missing" but "the code is present and unreachable".
+
+### What it reads now
+
+```
+c5adc   : eFuse calib version=1, init_code=0x07af, cal point=2276 code -> 2300 mV (ok)
+c5adc   : unit 1, 6 channel(s), 12-bit, atten 12 dB, calibrated full scale 4131 mV
+c5adc   : ch0 (GPIO1) raw=2613 then 2599, max=4095, 2639 mV (calibrated)
+c5adc   : ch3 (GPIO4) raw=4095 then 4095, max=4095, 4131 mV (calibrated)
+```
+
+The eFuse line is the provenance, and it is printed for a reason: `version=1`
+means this **part** carries factory calibration, with a single reference point
+(2276 counts = 2300 mV) that the curve fit is anchored to. If a part came back
+with `version=0`, the component would fall back to run-time self-calibration and
+the test now says so instead of quietly reporting numbers of a different quality.
+
+### Two fixes, and the second is the one that matters
+
+**1. `get_vref()` can be honest now.** RT-Thread models a conversion as a straight
+line, `value * vref / (2^bits - 1)`, while this chip is calibrated by a curve with
+per-channel compensation. The vref is derived from the calibration at **full
+scale** — 4131 mV — which makes that line exact at the top of the range and close
+in between. It is an approximation and the header says so. The exact per-channel
+value comes from `rt_hw_adc_raw_to_mv()`, which calls
+`adc_cali_raw_to_voltage()`.
+
+**2. The hardware offset code was never applied.** This is the part that would
+have been wrong even with perfect curve fitting. IDF's `adc_oneshot_read()` does
+this on **every** conversion (`adc_oneshot.c:237-238`):
+
+```c
+adc_hal_calibration_init(handle->unit_id);
+adc_set_hw_calibration_code(handle->unit_id, atten);
+```
+
+The port had neither. The raw codes therefore carried the SAR's offset error, and
+the curve fit was correcting a number that had not been corrected upstream of it.
+Applied per conversion now, at two register writes per read.
+
+### What is still not proven
+
+**Accuracy.** There is no way to inject a known voltage from this board — no DAC,
+no reference, and the pads that are free enough to probe are being driven by other
+peripherals in this image. What IS proven is: the calibration data exists on this
+part and is the right version, the conversion path runs and returns millivolts,
+and the numbers move with the input rather than sitting at a constant.
+
+A real accuracy claim needs a bench supply on one channel and a comparison against
+a meter. Stated rather than approximated.
+
+**Also unchanged:** channels 0-2 sit on pads the rest of this image drives (GPIO1/2
+are LP_UART, GPIO3 is the PWM test), and GPIO4 reads full scale because the CAN
+driver parks it for analog. The readings from those four are real measurements of
+those pads, not of an external signal.
+
 ## 18. Both bands, measured separately
 
 
@@ -2481,10 +2552,10 @@ bands   : ssid[2] ch=1   len=23 : e5 88 bb e4 ba 8e e6 99 b4 e7 a9 ba ... 5f 32 
 
 | Band | SSID | Channel | BSSID | Board RSSI |
 | --- | --- | --- | --- | --- |
-| 2.4 GHz | `<AP>_2.4G` | 1 | `d4:ee:07:40:1f:26` | -53 to -57 |
-| 5 GHz | `<AP>_5G` | 60 | `d0:ee:07:40:1f:27` | -56 to -57 |
+| 2.4 GHz | `刻于晴空之上_2.4G` | 1 | `d4:ee:07:40:1f:26` | -53 to -57 |
+| 5 GHz | `刻于晴空之上_5G` | 60 | `d0:ee:07:40:1f:27` | -56 to -57 |
 
-No AP broadcasts the bare `<AP>`; joining that returns `reason=201`
+No AP broadcasts the bare `刻于晴空之上`; joining that returns `reason=201`
 (NO_AP_FOUND), which is correct.
 
 ### 18.2 Both bands, all four measurements (at the 5760-byte window)
@@ -2518,7 +2589,7 @@ txstats : ok=1427 nomem=0 other=0
 
 rx      : 401408 bytes in 1375 ms = 2335 kbit/s (checksum 0x88306)
 
-found AA:BB:CC:DD:EE:FF rssi=-41 name='c5-rtt'
+found 14:C1:9F:8A:11:3A rssi=-41 name='c5-rtt'
 identity characteristic: 8ec90002-... = b'C5RT'
 notifications: 7 [3, 4, 5, 6, 7, 8, 9]
 RESULT: PASS
@@ -2595,6 +2666,7 @@ success:
 | what | how it is checked | section |
 | --- | --- | --- |
 | `uart0`, `pin`, `pwm0`, `i2c0`, `adc1`, `spi0`, `pcnt0` | `list device`, plus per-device tests | §17a-§17j |
+| ADC calibration | eFuse curve fitting + HW offset code; `c5adc` prints millivolts | §17u |
 | TWAI (CAN) | loopback at 125k/250k/500k/1M, bit timing exact | §17f |
 | `can0` (rt_can) | a frame through open/write/read comes back unchanged | §17r |
 | `c5probe` | which pads respond on this package: all 29 do | §17t |
@@ -2614,7 +2686,7 @@ success:
 | --- | --- |
 | SDIO slave | needs a host on the other end; cannot be self-tested |
 | LCD / camera via PARLIO RX | PARLIO RX not written (TX is) |
-| ADC voltage conversion | raw codes only; `get_vref()` returns 0 |
+| ADC accuracy | millivolts are computed (§17u); **accuracy against a reference is not measured** |
 
 Each new peripheral needs its `RT_USING_*` macro in `port/esp32c5/rtconfig.h`,
 its file in the C5 `target_srcs`, and - measured five times now - a `-u` link
@@ -2656,7 +2728,7 @@ flag, because an `INIT_*_EXPORT` data entry does not survive `--gc-sections`.
 11. **Long-run stability.** No soak test; the longest hold is 60 s.
 12. **AP state after repeated runs** — `reason=2` (AUTH_EXPIRE) after six quick
     associations from one MAC.
-13. **ADC voltage conversion.** Raw codes only; `get_vref()` returns 0.
+13. ~~**ADC voltage conversion.**~~ **Done in §17u** - eFuse curve fitting, per-channel compensation, and the hardware offset code applied per conversion. `c5adc` prints millivolts and `rt_adc_voltage()` now returns a number.
 
 **Numbers that are bounds, not characterisations**
 
