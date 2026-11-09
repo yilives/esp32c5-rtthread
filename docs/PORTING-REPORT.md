@@ -2679,6 +2679,67 @@ exercised without a real producer.
 Also not proven: PSRAM as executable memory, and the interaction with flash
 encryption (16-byte alignment on this part).
 
+## 17x. Round 35: a soak test, and the wrong clock it started with
+
+The last gap that needed no instrument, only time: "no soak test; the longest hold
+is 60 s", open since round 11.
+
+```
+c5soak  : 2000 round(s), 1 ms apart; internal heap 17088/65536 used, PSRAM 8126400 byte(s) free
+c5soak  : 200/2000  smem used 17088  psram free 8126400
+c5soak  : tick advanced 145999 ms, hardware clock advanced 145999 ms, difference 0 ms
+c5soak  : internal heap used 17088 -> 17088 (worst 17088), tolerance 512
+c5soak  : PSRAM free 8126400 -> 8126400 (worst 8126400), tolerance 65536
+c5soak  : PASS
+```
+
+### Four numbers, because one of them hides three failures
+
+A leak in a small kernel shows up as one of four things, and a test that watched
+only `used` would miss the other three:
+
+| metric | what it catches |
+|---|---|
+| `used` at the END of each round | the obvious leak; end-of-round sampling means a leak freed later in the same round still shows |
+| `used` **worst** over the run | a transient peak growing - a leak inside a short-lived path where the resting value looks fine |
+| tick vs **hardware clock** | a scheduler losing interrupts under load; no allocation counter sees it |
+| thread and semaphore churn | create/delete leaks in code that allocates nothing itself |
+
+Each round allocates 16 small blocks (which stay in the 65 KB internal region), 4
+blocks of 128 KB (which must fall through to PSRAM), creates two semaphores, and
+starts two threads that exit immediately - the latter being the case that leaks a
+stack and a TCB when teardown is wrong.
+
+### The wrong clock, and how it was caught
+
+The first version compared `rt_tick_get_millisecond()` against `rounds * delay_ms`
+and reported **1439 ms of drift on a 1479 ms run**:
+
+```
+c5soak  : elapsed 1479 ms, asked for 40 ms of sleep, drift 1439 ms
+c5soak  : FAIL, tick drifted 1439 ms from the requested sleeps
+```
+
+That is not drift. Each round also creates threads, creates semaphores and memsets
+512 KB, none of which is "sleep" - **the comparison was measuring the test's own
+work and calling it a scheduler fault.** A test that fails on its own second run
+is testing the wrong thing, and this one failed on its first.
+
+The fix is to compare the RT-Thread tick against `esp_timer_get_time()`, which
+runs off the systimer and not off the RT-Thread tick. Then the measurement is the
+one worth making - does the tick keep up with real time while the kernel is busy -
+and it reads **0 ms of difference over 145.999 s**.
+
+### What this does NOT prove
+
+* **Not the absence of a leak.** A few bytes per hour is invisible to a test that
+  runs for two and a half minutes. What is proven is no leak larger than 512 bytes
+  per 2000 rounds of that specific churn.
+* **Not a driver or radio soak.** No Wi-Fi, no BLE, no peripheral. A driver losing
+  DMA descriptors or netbufs is not visible here at all.
+* **Not thermal.** No temperature logging during the run, so a drift caused by
+  the part heating up would not be attributed to it.
+
 ## 18. Both bands, measured separately
 
 
@@ -2829,6 +2890,7 @@ success:
 | PSRAM | 1 MB byte-exact with a position-dependent pattern | §17g |
 | `rt_malloc()` → PSRAM | **4 MB allocated, written and read back; small blocks stay in SRAM** | §17v |
 | DMA → PSRAM | **byte-exact both directions with cache flush/invalidate; fails without them** | §17w |
+| Kernel soak (`c5soak`) | 2000 rounds: both heaps flat, tick vs hardware clock within 1 ms | §17x |
 | LP core | arithmetic exact at 100/2000/5000/20000 loops, restarts | §17k |
 
 **Still absent, all reported as supported by `soc_caps.h`:**
@@ -2875,7 +2937,9 @@ flag, because an `INIT_*_EXPORT` data entry does not survive `--gc-sections`.
 
 10. **OTA, secure boot, flash encryption.** Flash was tested with a single 16 KB
     write/read cycle.
-11. **Long-run stability.** No soak test; the longest hold is 60 s.
+11. ~~**Long-run stability.**~~ **Kernel soak in §17x**: 2000 rounds, both
+    heaps flat, tick within 1 ms of the hardware clock. Still open: a soak that
+    includes Wi-Fi/BLE or any driver - this one is the kernel only.
 12. **AP state after repeated runs** — `reason=2` (AUTH_EXPIRE) after six quick
     associations from one MAC.
 13. ~~**ADC voltage conversion.**~~ **Done in §17u** - eFuse curve fitting, per-channel compensation, and the hardware offset code applied per conversion. `c5adc` prints millivolts and `rt_adc_voltage()` now returns a number.
