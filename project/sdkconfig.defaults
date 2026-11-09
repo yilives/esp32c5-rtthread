@@ -1,0 +1,137 @@
+﻿# ESP32-C5 + RT-Thread bring-up image.
+#
+# Measured hardware (esptool on COM21, 2026-11-04):
+#   Chip type:        ESP32-C5HR8 (revision v1.2)
+#   Features:         Wi-Fi 6 (dual-band), BT 5 (LE), IEEE802.15.4,
+#                     Single Core + LP Core, 240 MHz, No Embedded Flash,
+#                     Embedded PSRAM 8 MB (AP_3v3)
+#   Crystal frequency: 48 MHz
+#   Flash:            Manufacturer 0x68, Device 0x4018, 16 MB
+#   MAC:              AA:BB:CC:DD:EE:FF
+#
+# "C5HR8": H = 16 MB flash in-package? No - "No Embedded Flash" and a 16 MB
+# external flash part are what the two reads above say, and R8 is the 8 MB
+# in-package PSRAM. Both were read from the chip, not from a datasheet.
+
+CONFIG_IDF_TARGET="esp32c5"
+
+# ---------------------------------------------------------------- flash ----
+# 16 MB, "Detected flash size: 16MB" from `esptool flash-id`.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# The crystal is autodetected and cannot be pinned on this target:
+# components/esp_hw_support/port/esp32c5/Kconfig.xtal offers ONLY XTAL_FREQ_AUTO
+# (the C5 supports 40 and 48 MHz parts, and boot-mode strapping plus
+# EFUSE_XTAL_48M_SEL decide which, recording the result in PCR_CLK_XTAL_FREQ).
+# IdF resolves that register at runtime, so there is no Kconfig choice to make
+# here - the boot log's "cpu freq" line is the readout. esptool reported 48 MHz
+# for this board.
+CONFIG_XTAL_FREQ_AUTO=y
+
+# DIO: the flash part is not identified as quad-capable by name, and QIO only
+# changes boot speed. Nothing here is boot-time critical yet.
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+
+# ------------------------------------------------------------------ OS -----
+# Replace the FreeRTOS kernel with RT-Thread (components/rtthread).
+CONFIG_IDF_RTOS_RTTHREAD=y
+
+# The C5 is a single-core SoC, but IDF still calls it a multi-core system until
+# FREERTOS_UNICORE selects ESP_SYSTEM_SINGLE_CORE_MODE. startup.c in this tree
+# #errors when IDF starts more cores than RT_CPUS_NR, so this is load-bearing
+# rather than cosmetic: with it left off the build stops with
+# "RT-Thread requires RT_USING_SMP when IDF starts multiple cores."
+CONFIG_FREERTOS_UNICORE=y
+CONFIG_ESP_SYSTEM_SINGLE_CORE_MODE=y
+
+# Must equal RT_TICK_PER_SECOND in components/rtthread/port/esp32c5/rtconfig.h.
+# port_systick.c has a _Static_assert on the pair.
+CONFIG_FREERTOS_HZ=1000
+
+# Keep the console on UART0 so rt_kprintf output is visible without the
+# driver/uart stack. 115200 is what RT_SERIAL_CONFIG_DEFAULT assumes.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+
+# Room for the RT-Thread heap and interrupt stack inside IDF's DRAM.
+#
+# The C5 has 320 KB-ish of HP SRAM (SOC_DRAM_HIGH - SOC_DRAM_LOW = 0x60000 =
+# 384 KB) shared between IRAM and DRAM, so the two regions have to fit next to
+# IDF's own allocations. 48 KB heap and 16 KB interrupt stack are the smallest
+# numbers that leave the shell, two demo threads and the `c5rt` self test with
+# headroom - measured on the S31 port that a 40 KB heap runs the same code with
+# ~16 KB used at idle.
+CONFIG_IDF_RTTHREAD_HEAP_SIZE=65536
+CONFIG_IDF_RTTHREAD_INTERRUPT_STACK_SIZE=16384
+
+# Custom partition table: 2 MB app so PSRAM/Wi-Fi experiments later do not have
+# to move the partition offsets again.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# ------------------------------------------------------------------ PSRAM --
+# The module reports 8 MB of in-package PSRAM, but the C5's PSRAM path needs the
+# MSPI timing work and the interrupt sweep that made it usable on the S31, and
+# none of that has been run here yet. Off is the honest starting point: an image
+# that asserts rom_index < 2 in the bootloader or takes an interrupt storm is a
+# worse first result than one that simply does not advertise PSRAM.
+CONFIG_IDF_RTOS_RTTHREAD_FREERTOS_SHIM=y
+# CONFIG_SPIRAM is not set
+
+# --------------------------------------------------------------- logging ---
+# Keep the ROM/IDF log out of the way of the shell: RT-Thread owns the UART once
+# the kernel starts, and IDF's early log is already printed before that.
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+
+
+# ------------------------------------------------------------- lwIP window --
+# The defaults are 5760 bytes for both the send buffer and the receive window,
+# i.e. four MSS. Every figure in the report before §20 was measured with that
+# window, so they are lower bounds on the radio rather than a characterisation.
+#
+# This is deliberately NOT the same experiment as report §12.2, which also raised
+# these and got a *worse* result. That run happened while the Wi-Fi driver was
+# starved of heap and returned ESP_ERR_NO_MEM for 100 of 125 frames (§15); the
+# bigger window merely kept more buffers outstanding and hit the wall sooner. The
+# defect that made it worse is fixed, so the measurement has to be redone.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=16
+
+# ------------------------------------------------ lwIP core locking (retested) --
+# Report §12.1 measured this as 9x WORSE and reverted it. That measurement was
+# taken while the Wi-Fi driver was starved of heap and rejecting 100 of 125
+# frames (§15), so it never tested core locking - it tested a broken image.
+#
+# Retested with §15 fixed, both bands, both directions:
+#
+#                    core locking off     core locking on
+#   5 GHz send          19213 kbit/s       19562 kbit/s
+#   5 GHz receive       10399 kbit/s       10040-12225 kbit/s
+#   2.4 GHz send        10426 kbit/s       18929 kbit/s (rssi differed)
+#
+# That is neutral within run-to-run noise, not 9x worse: the old verdict was an
+# artefact of the starved driver, and it is withdrawn. Left OFF because it buys
+# nothing measurable here and the IDF default is the better-tested path.
+# CONFIG_LWIP_TCPIP_CORE_LOCKING is not set
+
+# ---------------------------------------------------------------- Bluetooth --
+# BLE only: the C5 controller library (components/bt/controller/lib_esp32c5/
+# libble_app.a) is BLE-only, and there is no BR/EDR blob for this part.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y
+CONFIG_BT_CTRL_BLE_ENABLE=y
+CONFIG_BT_CTRL_BREDR_ENABLE=n
+CONFIG_BT_BLE_50_FEATURES_SUPPORTED=y
+# Room for the controller's task stack and the host's pools.
+
+
+
+
+
+
+
+

@@ -1,0 +1,30 @@
+﻿# Build output, as produced by idf.py / the helper script
+build/
+*.bin
+*.elf
+*.map
+sdkconfig
+sdkconfig.old
+sdkconfig.ci
+sdkconfig.*.bak
+
+# Credentials - never commit these
+project/main/wifi_creds.h
+**/wifi_creds.h
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Scratch output from the serial harness
+*.log
+*.txt.tmp

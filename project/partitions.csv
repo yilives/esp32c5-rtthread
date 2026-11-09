@@ -1,0 +1,16 @@
+# ESP32-C5 bring-up image: one app slot, no OTA, no filesystem.
+#
+# 16 MB of flash (measured), so the application gets 2 MB. The stock single-app
+# table gives it 1 MB, which will not be enough once PSRAM and Wi-Fi are linked
+# in on this part.
+#
+# nvs and phy_init are the two data partitions the drivers need, and they keep
+# the offsets IDF's stock table uses (0x9000 and 0xf000), so a board flashed with
+# either table still finds its PHY calibration data in the same place.
+#
+# Note: only '#' starts a comment here - gen_esp32part.py parses every other line
+# as a partition row.
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+factory,  app,  factory, 0x10000,  0x200000,
