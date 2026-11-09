@@ -2606,6 +2606,79 @@ a plausible run of zeros.
   notably the heap change did not cost throughput even though lwIP's buffers now
   come from memheap.
 
+## 17w. Round 34: DMA to PSRAM, and the cache discipline it needs
+
+`rt_malloc()` reaching 8 MB (§17v) is only half of what a large buffer is
+for; the other half is feeding it to a peripheral. On this chip that is not free,
+because PSRAM sits behind the SPI cache, and the first measurement says so
+unambiguously:
+
+```
+c5dma   : direction matrix, 256 bytes, no cache sync anywhere
+c5dma   : SRAM -> SRAM                 err= 0  dst[0..3]=c3 e6 89 ac  0/256 differ
+c5dma   : SRAM -> PSRAM                err=-1  dst[0..3]=00 00 00 00  256/256 differ
+c5dma   : PSRAM -> SRAM                err=-1  dst[0..3]=4a 00 20 0a  256/256 differ
+c5dma   : PSRAM -> PSRAM               err=-1  dst[0..3]=00 00 00 00  256/256 differ
+```
+
+**Every PSRAM direction fails; SRAM to SRAM succeeds.** That is the whole story:
+the DMA engine is fine, the bytes it is asked to move are not where it looks.
+
+With `esp_cache_msync()` around the transfer:
+
+```
+c5dma   : PSRAM->PSRAM with cache sync: byte-exact
+c5dma   : PSRAM->SRAM with cache sync: byte-exact
+c5dma   : control without cache sync failed (-1)
+c5dma   : PASS
+```
+
+### The two rules and which failure each prevents
+
+| direction | operation | what breaks without it |
+|---|---|---|
+| CPU writes " + chr(0x2192) + " DMA reads | flush (`DIR_C2M`) | the DMA reads whatever was in the PSRAM chip before; the CPU's bytes are still in cache |
+| DMA writes " + chr(0x2192) + " CPU reads | invalidate (`DIR_M2C`) | the cache keeps serving its stale copy after the DMA overwrote memory |
+
+The destination is invalidated **before and after** the copy. Before, so a dirty
+line cannot be written back over the DMA's output; after, so the CPU's next read
+comes from memory. `rt_hw_dma_memcpy_cached()` is the wrapper that does this and
+then calls the cache-agnostic `rt_hw_gdma_memcpy()` - keeping them separate is
+deliberate, because hiding the sync inside the copy would make it impossible to
+measure whether the sync is needed.
+
+### Three things this cost, all the same shape
+
+The first version reported four failures that were all its own:
+
+1. **A 4 KB request landed in internal SRAM.** `rt_malloc(4096)` is satisfied by
+   the 65 KB system heap on the first try, so the "PSRAM" test was measuring SRAM.
+   The buffers are now requested at 256 KB - larger than the system heap - and the
+   test asserts they are above `SOC_EXTRAM_DATA_LOW` before using them.
+2. **4000 bytes is the descriptor limit, not 4096.** `DMA_DESCRIPTOR_BUFFER_MAX_SIZE`
+   is 4095 and going over returns `-RT_EINVAL`, which the test printed as a cache
+   failure.
+3. **memheap aligns to 8 bytes; `esp_cache_msync()` needs 32.** News of the
+   failure was `flush failed`, but the first version did not print it - the code
+   returned `-RT_ERROR` and the *caller* printed "copy mismatch", which sent the
+   investigation at the DMA instead of at the alignment.
+
+And one reporting bug worth recording: `-RT_ERROR` covers both "descriptor error"
+and "content mismatch", so the negative control's failure read as
+"mismatched, as expected" even when the copy had not run at all. The matrix at the
+top of the test is what separates those, and the control now says which one it is.
+
+### What is still not proven
+
+**A peripheral streaming into PSRAM while the CPU reads behind it.** This test
+proves the discipline for a transfer the CPU starts and waits for. Streaming needs
+the cache lines around the read pointer invalidated *as the transfer advances*,
+and the rule there is "invalidate before reading, never after" - which cannot be
+exercised without a real producer.
+
+Also not proven: PSRAM as executable memory, and the interaction with flash
+encryption (16-byte alignment on this part).
+
 ## 18. Both bands, measured separately
 
 
@@ -2755,6 +2828,7 @@ success:
 | PARLIO | GDMA feeds it, unit reads every bit, PCNT sees the clock | §17q |
 | PSRAM | 1 MB byte-exact with a position-dependent pattern | §17g |
 | `rt_malloc()` → PSRAM | **4 MB allocated, written and read back; small blocks stay in SRAM** | §17v |
+| DMA → PSRAM | **byte-exact both directions with cache flush/invalidate; fails without them** | §17w |
 | LP core | arithmetic exact at 100/2000/5000/20000 loops, restarts | §17k |
 
 **Still absent, all reported as supported by `soc_caps.h`:**
