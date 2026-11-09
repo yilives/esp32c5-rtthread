@@ -2740,6 +2740,77 @@ and it reads **0 ms of difference over 145.999 s**.
 * **Not thermal.** No temperature logging during the run, so a drift caused by
   the part heating up would not be attributed to it.
 
+## 17y. Round 36: LP I2C — IDF's own driver works, and six differences were not it
+
+The decisive experiment promised last round: run ESP-IDF's own LP I2C driver on
+the same board and see whether it too fails.
+
+**It works.**
+
+```
+c5lpi2cidf: i2c_new_master_bus -> 0x0
+c5lpi2cidf: i2c_master_bus_add_device -> 0x0
+c5lpi2cidf: i2c_master_transmit to 0x7F -> 0x108 (NACK - the bus WAS driven)
+c5lpi2cidf: IDF left ctr=0x00000000 fifo_conf=0x00004046 scl_low=119 scl_high=62
+c5lpi2cidf: IDF left cmd[0]=0x80003000 cmd[1]=0x00000902 cmd[2]=0x00001000
+```
+
+`0x108` is `ESP_ERR_INVALID_RESPONSE`, which IDF's header defines as "master
+transmit receives NACK". To a reserved address that is the **success** case: the
+controller drove a start condition and clocked nine bits, and something pulled the
+ninth low. The same register block, the same pads, the same board - driven by
+IDF's driver, it works; driven by `lp_i2c.c`, it does not.
+
+**So the fault is in this port's driver, not in the silicon, and it is findable by
+comparison.** That changes the status of LP I2C from "blocked on the hardware" to
+"blocked on finding one difference".
+
+### Six differences removed, none of them it
+
+Working from the register dump and IDF's source:
+
+| difference | result |
+|---|---|
+| the address and the first data byte are **one** WRITE in IDF, two commands here | fixed - still fails |
+| IDF emits RESTART/WRITE/STOP, this driver added a fourth `END` command | fixed - still fails |
+| FIFO written **before** the command word (IDF) vs after (here) | fixed - still fails |
+| FIFO watermarks left at reset (6/2) vs set to 4/8 here | fixed - still fails |
+| timing applied per transfer (IDF) vs once at init (here) | fixed - still fails |
+| `i2c_ll_disable_intr_mask()` + `i2c_ll_master_set_filter()` not called here | fixed - still fails |
+
+After all six, the command words are byte-identical to IDF's (`0x3000`, `0x902`,
+`0x1000`; the `0x80000000` bit in IDF's `cmd[0]` is `command_done` written back by
+the hardware), `fifo_conf` is `0x4046` in both, the timing registers agree, and
+`int_raw` is still `0x00000000` with every `command_done` clear.
+
+### What that leaves
+
+The difference has to be in state that neither the dump nor the source comparison
+covers. The most likely candidate, and the one worth testing next, is
+**`LP_CLKRST.lpperi.lp_i2c_clk_sel` plus whatever the LP-domain clock is actually
+doing** - IDF's driver may leave the LP peripheral clock configuration in a state
+this driver resets at init and never restores, in which case the block reads and
+writes correctly while the FSM has no clock at all. That is consistent with every
+observation: registers accessible, commands writable, no events ever.
+
+That is a hypothesis, not a finding, and it is listed as one.
+
+### Also found: IDF's driver is not safe to delete
+
+`i2c_master_bus_rm_device()` + `i2c_del_master_bus()` on this port **panics**:
+
+```
+assert failed: vSemaphoreDeleteWithCaps idf_additions.c:347
+```
+
+The FreeRTOS shim's semaphore wrapper refuses a delete it did not hand out. That
+is a real defect in this port's shim, worth its own investigation, and it means the
+comparison test leaves the board rebooting rather than clean - the answer arrives
+before the crash, but the crash is not acceptable.
+
+**Status: LP I2C is not working, the fault is in this port's driver, six candidate
+causes are eliminated, and the next one to test is named.**
+
 ## 18. Both bands, measured separately
 
 
@@ -2880,7 +2951,7 @@ success:
 | TWAI (CAN) | loopback at 125k/250k/500k/1M, bit timing exact | §17f |
 | `can0` (rt_can) | a frame through open/write/read comes back unchanged | §17r |
 | `c5probe` | which pads respond on this package: all 29 do | §17t |
-| `c5lpi2c` | **written, FSM never starts** - see the section for what is ruled out | §17t |
+| `c5lpi2c` | **written, FSM never starts.** IDF's own driver DOES work on the same board - see §17y | §17t |
 | RMT | TX waveform measured back by RX: 19 symbols, mean half 4761 ticks = request | §17o |
 | MCPWM | frequency and duty measured at the pad, 50 Hz - 40 kHz | §17h |
 | Temperature | two-band cross-check proves the range register took | §17e |
