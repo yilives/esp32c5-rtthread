@@ -2531,6 +2531,81 @@ are LP_UART, GPIO3 is the PWM test), and GPIO4 reads full scale because the CAN
 driver parks it for analog. The readings from those four are real measurements of
 those pads, not of an external signal.
 
+## 17v. Round 33: `rt_malloc()` reaches the 8 MB
+
+The last thing listed as "not done" for thirty rounds. It works now, and the
+interesting part is that **the obvious configuration does not work at all**.
+
+```
+c5heap  : PSRAM heap registered, 8126464 byte(s); window 0x42000000..0x44000000
+c5heap  :    1024 B  at 0x40833020  SRAM     content OK
+c5heap  :   16384 B  at 0x40836450  SRAM     content OK
+c5heap  : 1048576 B  at 0x421409dc  PSRAM    content OK
+c5heap  : 4194304 B  at 0x421409dc  PSRAM    content OK
+c5heap  : 8 x 512 KB held simultaneously
+c5heap  : PASS
+```
+
+### The constraint nobody documents
+
+The plan was to keep `RT_USING_SMALL_MEM_AS_HEAP` and register a second memheap
+for the PSRAM. **That silently does nothing**, and the reason is in `kservice.c`:
+
+```c
+#if   defined(RT_USING_SMALL_MEM_AS_HEAP)
+...
+#elif defined(RT_USING_MEMHEAP_AS_HEAP)      /* <- the fallback lives in here */
+...
+#endif
+```
+
+The walk over "every other memheap" is inside `_memheap_alloc()`, which only
+exists under `MEMHEAP_AS_HEAP`. With small-mem as the heap, a second memheap
+appears in the object list and `rt_malloc()` never looks at it. Nothing warns.
+
+So the system heap itself had to become a memheap. **The trade, stated plainly:**
+the 65 KB internal region now pays a ~40-byte header per allocation instead of a
+few bytes. In exchange `rt_malloc(4 MB)` succeeds. Measured effect on memory use:
+system heap `used` went 17088 → 17088 after the test ran and freed, with `max`
+rising from 20864 to 33504 - so the running peak costs about 12 KB more, not 40
+bytes per live object multiplied by everything.
+
+### Why not one merged pool
+
+Merging internal SRAM and PSRAM into a single allocator has to pick one, and both
+choices are wrong here:
+
+* small-mem over PSRAM: every allocation pays the SPI-cache penalty, on every
+  access to the object too;
+* memheap over 65 KB: 40 bytes of header per allocation in the region that is
+  tightest.
+
+Two pools with small-first fallback gives the behaviour actually wanted, and the
+test asserts **both directions** - a test that only checked "a big allocation
+works" would pass even if everything went to PSRAM, which would be the wrong
+outcome.
+
+### Why the test writes a pattern
+
+A pointer into the PSRAM window that is not backed by the part reads back whatever
+the bus returns, and an allocator bug that overlaps blocks reads back the other
+block's data. The pattern `(i * 31) ^ (i >> 8) ^ 0x5A` differs at every offset, so
+a short block, an offset error or an overlap all show up as a mismatch instead of
+a plausible run of zeros.
+
+### What this does NOT prove
+
+* **PSRAM under DMA.** The SPI DMA path to PSRAM is not exercised; `c5gdma`
+  transfers from internal RAM only.
+* **PSRAM as executable memory.** Not attempted.
+* **The cache-coherency rules.** Anything the SPI peripherals DMA into or out of a
+  PSRAM buffer needs `esp_cache_msync()` around the transfer. Nothing in this port
+  does that yet, because nothing DMAs to PSRAM yet.
+* **Wi-Fi throughput is unchanged by this.** Re-measured after the switch:
+  **21822 kbit/s** on 5 GHz against 23686 before - within run-to-run noise, and
+  notably the heap change did not cost throughput even though lwIP's buffers now
+  come from memheap.
+
 ## 18. Both bands, measured separately
 
 
@@ -2653,7 +2728,8 @@ Memory as finally configured (`c5-rtt-full/sdkconfig.defaults`):
 | `CONFIG_LWIP_TCP_WND_DEFAULT` | 32768 | was 5760 |
 | `CONFIG_LWIP_TCPIP_CORE_LOCKING` | off | neutral in retest, §15.2 |
 | IDF heap free, both stacks up | ~97 KB | measured with `c5stat` |
-| RT-Thread heap used | 51 of 64 KB | tight; PSRAM is up but `rt_malloc()` cannot reach it |
+| RT-Thread heap used | 17 of 64 KB at rest, 33 KB peak | `rt_malloc()` reaches the
+8 MB PSRAM for large blocks since §17v |
 
 ## 21. What is not done
 
@@ -2678,6 +2754,7 @@ success:
 | AHB GDMA | mem-to-mem byte-exact at 1/16/128/256 B, no overrun | §17n |
 | PARLIO | GDMA feeds it, unit reads every bit, PCNT sees the clock | §17q |
 | PSRAM | 1 MB byte-exact with a position-dependent pattern | §17g |
+| `rt_malloc()` → PSRAM | **4 MB allocated, written and read back; small blocks stay in SRAM** | §17v |
 | LP core | arithmetic exact at 100/2000/5000/20000 loops, restarts | §17k |
 
 **Still absent, all reported as supported by `soc_caps.h`:**
@@ -2694,12 +2771,11 @@ flag, because an `INIT_*_EXPORT` data entry does not survive `--gc-sections`.
 
 **Chip capabilities untouched**
 
-1. **8 MB in-package PSRAM.** Now enabled and verified (§17g), but **RT-Thread's own
-   allocator still does not use it** — the IDF `heap_caps` heap holds the 8 MB and
-   `rt_malloc()` runs on the fixed 64 KB region. Bridging them is the fix for the
-   one resource that is still tight (RT-Thread heap: 16.6 of 65.4 KB used, 20.4 KB
-   peak) and it needs MSPI
-   timing tuning plus the interrupt sweep, not just a Kconfig switch.
+1. **8 MB in-package PSRAM.** Enabled (§17g) and **now reachable through `rt_malloc()`**
+   (§17v): a second memheap named `psram`, with auto-binding so small
+   allocations stay in the 65 KB internal region and large ones fall through to
+   PSRAM. Verified by pointer address and by content, not inferred from the
+   configuration.
 2. **The LP core runs** (§17k) and **deep sleep works** (§17s): a timer wake
    brings the board back with the RTC marker intact. **LP peripherals are not
    exercised** - LP I2C, LP UART and ETM all need their own port layer.
