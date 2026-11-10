@@ -442,6 +442,48 @@ level is read back and printed separately so the pad state is asserted rather th
 inferred: a silently failed pad setup would leave the loopback passing while
 proving nothing, which is exactly the LP I2C failure shape.
 
+## The CAN device class worked exactly once per boot
+
+Found by running `c5can` twice instead of once. Three stacked causes, each of which
+alone produces the same symptom — `rt_device_write()` returning 0.
+
+| layer | cause | why it hid |
+|---|---|---|
+| 1 | a finished TX buffer is never returned to Empty (state 8); it sits in TX_OK (4) | `c5twai` bypasses the device class entirely |
+| 2 | framework box numbers and hardware TX buffer indices are **two different spaces**, and `sendmsg` discarded the box number it was given | only shows up once layer 1 makes the driver stop using buffer 0 |
+| 3 | the interrupt is armed on the **first** open only, while this driver's exit path disables it on purpose | `c5can` ran once per boot, so it never re-opened |
+
+Measured on the second run:
+
+```
+c5twai: tx_status=0x00008884 buffer(s)=4: [0]=4 [1]=8 [2]=8 [3]=8
+```
+
+State 4 on buffer 0 — **the frame had gone out and completed**, while the device
+class waited for a completion no ISR would deliver.
+
+**Each test covered the other's blind spot, and together they looked like full
+coverage.** That is the general lesson: two tests that both pass can still leave a
+whole path untested when they take different routes through it.
+
+Verified now with five consecutive runs interleaved with `c5twai`:
+
+```
+c5can PASS, c5can PASS, c5twai PASS (4 rates), c5can PASS, c5twai PASS, c5can PASS
+```
+
+### A stale pin table certified a conflict
+
+The LP UART's pads are fixed by the LP IOMUX (this part does not define
+`SOC_LP_GPIO_MATRIX_SUPPORTED`), so IO4/IO5 belong to it. CAN and PCNT moved to
+IO26/IO27 — both go through the GPIO matrix.
+
+Measured before the move: `c5can` PASS, `c5lpuart` PASS, `c5can` **FAIL**.
+`c5pins` reported PASS throughout, because its table still listed IO2 as SPI MISO
+and IO3 as the PWM test — both had already moved to IO23/IO24 — and did not know
+the LP peripherals existed. **A pin table that is not maintained is worse than
+none: it certifies a conflict.**
+
 ## The pre-build guard check
 
 Nine separate times, an Xtensa debugging probe added to shared code broke the

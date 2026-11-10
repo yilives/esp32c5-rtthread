@@ -3129,6 +3129,75 @@ nothing about the pins - which is exactly the LP I2C failure shape. The RXD pad
 level is therefore read back and printed separately, so the pad state is asserted
 rather than inferred.
 
+## 17ad. Round 41: the CAN device class worked exactly once per boot
+
+Found by running `c5can` twice instead of once. Three stacked causes, each of
+which alone produces the same symptom - `rt_device_write()` returning 0.
+
+### Layer 1: a finished TX buffer is never returned to Empty
+
+The 4-bit TX buffer state field uses **8 for Empty**, and a buffer that finished a
+frame sits in **TX_OK (4)**. Only Empty accepts a new frame, and nothing put them
+back:
+
+```
+c5twai: tx_status=0x00008884 buffer(s)=4: [0]=4 [1]=8 [2]=8 [3]=8
+```
+
+State 4 on buffer 0, empty on the rest. So each frame consumed one buffer and the
+driver would eventually run out. Fixed with
+`rt_hw_twai_reclaim_tx_buffers()`, which scans `tx_status` and issues
+`TX_CMD_EMPTY` for every finished buffer, returning a bitmask of what it reclaimed.
+
+### Layer 2: two index spaces that look alike
+
+`_can_int_tx()` (`dev_can.c:186`) numbers boxes from **its own freelist** and
+addresses completions with `event >> 8` in that numbering. This controller has its
+own TX buffer indices, chosen by scanning for an Empty buffer. `c5_can_sendmsg()`
+received the former as `boxno` and **discarded it** (`(void)boxno;`), so nothing
+recorded which hardware buffer a box's frame went into - and the ISR guessed box
+0.
+
+Fixed by having the send path return the hardware index
+(`rt_hw_twai_send_ex()`), keeping a `box -> hardware buffer` map, and translating
+back in the ISR. Reporting the raw hardware index there would have been wrong for
+the same reason the hardcoded 0 was: the two spaces are not the same space.
+
+### Layer 3: the interrupt was armed once and then switched off
+
+This is the one that actually kept it broken after the first two fixes.
+
+`c5_can_configure()` runs from `rt_can_init()` on the **first open only** - the
+framework initialises the device once - so a second open never reaches
+`c5_can_irq_arm()`. Meanwhile this driver's own exit path **disables the
+interrupt on purpose**, because leaving it armed makes `c5twai` read an RX
+overflow flag from the previous test:
+
+```c
+twaifd_ll_enable_intr(&TWAI0, 0);   /* at the end of c5can */
+```
+
+So after one run the hardware mask was 0, and the second run's TX_DONE never
+arrived. The frame had gone out and completed - `tx_status` said so - while the
+device class waited for a completion no ISR would deliver.
+
+Fixed by re-arming in `RT_CAN_CMD_SET_BAUD`: any command that reprograms the
+hardware re-arms, so the state does not depend on how many times the device was
+opened.
+
+### Why it stayed hidden for so long
+
+`c5can` runs once per boot, which skips layers 2 and 3. `c5twai` calls
+`rt_hw_twai_send()` directly and never waits on the device class's completion,
+which skips layers 1 and 2. **Each test covered the other's blind spot, and
+together they looked like full coverage.**
+
+The verification is now five consecutive runs plus interleaving with `c5twai`:
+
+```
+c5can PASS, c5can PASS, c5twai PASS (4 rates), c5can PASS, c5twai PASS, c5can PASS
+```
+
 ## 18. Both bands, measured separately
 
 
