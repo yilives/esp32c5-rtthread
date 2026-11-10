@@ -3053,6 +3053,82 @@ everything except the byte stream and the ACK path in the other direction.
 Also not yet done: LP UART. It uses the same pad-configuration path that was wrong
 here, so it is worth writing now that the path is known to work.
 
+## 17ac. Round 40: LP UART, in one round instead of thirteen
+
+```
+c5lpuart: PASS at 115200 baud
+c5lpuart: PASS at 921600 baud
+c5lpuart: PASS at 9600 baud
+c5lpuart: 16 byte(s) looped back byte-exact
+c5lpuart: 20 byte(s) looped back byte-exact (1 FIFO(s))
+c5lpuart: 40 byte(s) looped back byte-exact (2 FIFO(s))
+```
+
+LP I2C took thirteen rounds. This took one, because the LP I2C failure named the
+three things to get right before writing a line:
+
+1. **`rtc_gpio_iomux_output()`/`input()` and then touch nothing else on that pad.**
+   LP I2C's correct pad setup was undone by four leftover raw `rtcio_ll_*` calls
+   below it;
+2. **bus clock before reset.** A reset pulse delivered to an unclocked block cannot
+   clear its register file;
+3. **verify the capability macro.** See below - this one cost a link error.
+
+### The bug that produces no warning at all
+
+```c
+#if defined(SOC_LP_UART_NUM) && (SOC_LP_UART_NUM >= 1)
+```
+
+`SOC_LP_UART_NUM` does not exist on this part. The real names are
+`SOC_UART_LP_NUM` (= 1) and `SOC_UART_HAS_LP_UART` (`soc_caps.h:523,530`). A
+misspelled macro in `#if` is **not** an error in C - it evaluates to 0 - so the
+entire file compiled to nothing and the only symptom was:
+
+```
+main.c:508: undefined reference to `c5_lp_uart_selftest'
+```
+
+three translation units away, with no diagnostic pointing at the cause.
+
+### Two of the test's own bugs, both caught by trying more than one case
+
+**First: write-all-then-read loses bytes.** The initial `xfer()` filled the TX
+FIFO, waited for idle, then drained RX. The LP receive FIFO is 16 bytes, so a
+20-byte message overflows it while the CPU is still pushing the transmit side.
+
+Measured: 16 bytes passed at 115200. **20 bytes failed at 921600 with all 20
+wrong.** The 115200 case was not correctness - the CPU happened to finish writing
+and start reading before the receiver filled past the FIFO. Reading and writing are
+now interleaved.
+
+**Second: changing a baud divisor is not a plain register write.**
+
+```
+c5lpuart 921600            -> PASS   (first call after boot)
+c5lpuart 115200 -> 921600  -> FAIL   15 of 16 bytes wrong
+```
+
+`rt_hw_lp_uart_init()` returns early once ready, so the second call only rewrote
+the divisor - with the loopback still enabled and both FIFOs still holding data
+clocked at the old rate. The receiver is mid-bit whenever there is traffic, so the
+new frame boundaries were decoded against stale samples. Fixed by disabling
+loopback, resetting both FIFOs and waiting for idle before touching the divisor.
+
+Neither bug would have shown up in a test that ran one size at one baud rate.
+
+### What this does not prove
+
+**The loopback is internal to the peripheral** (`uart_ll_set_loop_back()` connects
+TXD to RXD inside the chip). The test proves the baud generator, the shifter, both
+FIFOs, the receive path and the LP clock - **not the pads and not a wire.**
+
+That gap is stated in the output itself rather than only here, because a pad
+configuration that silently failed would leave the loopback passing while proving
+nothing about the pins - which is exactly the LP I2C failure shape. The RXD pad
+level is therefore read back and printed separately, so the pad state is asserted
+rather than inferred.
+
 ## 18. Both bands, measured separately
 
 

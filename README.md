@@ -395,6 +395,53 @@ peripheral — which is exactly what narrowed the search to outside the controll
 **Not proven:** a successful data transfer. There is no I2C slave on this board, so
 a NACK from a reserved address is the strongest result available.
 
+## LP UART, and the bug that produces no warning at all
+
+Written in one round, after LP I2C took thirteen — because that failure named the
+three things to get right first: use `rtc_gpio_iomux_output/input()` and then
+touch nothing else on the pad, enable the bus clock before the reset pulse, and
+verify the capability macro.
+
+```
+msh > c5lpuart 115200
+c5lpuart: 16 byte(s) looped back byte-exact
+c5lpuart: 20 byte(s) looped back byte-exact (1 FIFO(s))
+c5lpuart: 40 byte(s) looped back byte-exact (2 FIFO(s))
+c5lpuart: PASS at 115200 baud
+```
+
+### `#if` on a macro that does not exist is not an error
+
+```c
+#if defined(SOC_LP_UART_NUM) && (SOC_LP_UART_NUM >= 1)
+```
+
+The real names on this part are `SOC_UART_LP_NUM` and `SOC_UART_HAS_LP_UART`. A
+misspelled macro in `#if` evaluates to 0, so **the whole file compiled to nothing**
+and the only symptom was `undefined reference to c5_lp_uart_selftest` three
+translation units away.
+
+### Two bugs in the test, both found by trying more than one case
+
+**Write-all-then-read loses bytes.** The LP receive FIFO is 16 bytes, so a 20-byte
+message overflows it while the CPU is still pushing the transmit side. 16 bytes
+passed at 115200; **20 bytes failed at 921600 with all 20 wrong.** The 115200 case
+was luck. Reading and writing are now interleaved.
+
+**Changing a baud divisor is not a plain register write.** `c5lpuart 921600`
+passed as the first call after boot and failed when it followed
+`c5lpuart 115200` — the init returns early once ready, so the second call rewrote
+the divisor with the loopback still on and both FIFOs holding data clocked at the
+old rate.
+
+### What it does not prove
+
+The loopback is **internal to the peripheral**. This proves the baud generator,
+shifter, both FIFOs and the LP clock — **not the pads and not a wire.** The RXD pad
+level is read back and printed separately so the pad state is asserted rather than
+inferred: a silently failed pad setup would leave the loopback passing while
+proving nothing, which is exactly the LP I2C failure shape.
+
 ## The pre-build guard check
 
 Nine separate times, an Xtensa debugging probe added to shared code broke the
