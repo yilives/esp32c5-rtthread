@@ -2949,6 +2949,110 @@ irrelevant.
 
 **Status: both tests pass in any order.** No change to what either proves.
 
+## 17ab. Round 39: LP I2C works - a fix undone by the code beneath it
+
+```
+c5lpi2c: transfer to the reserved address 0x7F returned -8
+c5lpi2c: PASS (the controller drove a start condition, clocked nine bits
+         and saw the address NACKed; there is no LP I2C slave on this board,
+         so no successful transfer is possible)
+```
+
+Thirteen rounds, thirteen eliminated candidates, and the cause was **a fix this
+port had already made, immediately undone by four lines left below it.**
+
+### The bug
+
+`c5_lp_i2c_set_pins()` was rewritten to use `rtc_gpio_*`, which is what IDF does,
+and the comment above it says so:
+
+```
+ * Use `rtc_gpio_*`, not the raw `rtcio_ll_*` calls.
+```
+
+Four raw calls then sat below that comment and did the opposite:
+
+```c
+rtc_gpio_iomux_input(pin, C5_LP_I2C_MUX_FUNC, 0);   /* pad -> RTC domain, LP function */
+...
+rtcio_ll_function_select(pin, RTCIO_LL_FUNC_DIGITAL);  /* -> back to the DIGITAL side */
+rtcio_ll_iomux_func_sel(pin, C5_LP_I2C_MUX_FUNC);      /* -> IOMUX select overwritten */
+```
+
+`rtc_gpio_iomux_input()` configures the pad as an RTC-domain input wired to the
+peripheral's function. The two calls after it re-select the digital function and
+overwrite the IOMUX select, **disconnecting the pad from the LP peripheral's
+input**.
+
+Every observation that sent thirteen rounds in the wrong direction follows from
+that one fact:
+
+* the register block reads fine - it *is* fine;
+* both clocks are enabled - they are;
+* the pads idle high - they do, on the digital side;
+* the command words are correct - they are;
+* `int_raw` stays empty - the controller never sees a start condition because its
+  SDA input is not connected to anything.
+
+### What the thirteen exclusions were worth
+
+I would not trade them. Every one was a real difference from IDF's driver, and
+each was removed on evidence. What they could not do is what the last experiment
+did:
+
+**Run IDF's driver, dump every register, and diff.** The dump came out identical
+field for field:
+
+```
+DUMP IDF  ctr=00000000 sr=00080000 to=0000002d fifo_conf=00004046
+DUMP PORT ctr=00000000 sr=00080000 to=0000002c fifo_conf=00004046
+DUMP IDF  scl_low=000000ef scl_high=0000ec7a sda_hold=0000003b sda_sample=00000077
+DUMP PORT scl_low=00000078 scl_high=0000743e sda_hold=0000001e sda_sample=0000003c
+```
+
+The only differences were the timing values, and both are correct for 100 kHz
+(IDF 119/62, this port 120/62). **A register comparison cannot see a pad that is
+no longer wired to the peripheral** - which is the point. It told me the
+controller was configured identically, so the difference had to be outside it.
+
+### The false negative that hid it for a round
+
+The hybrid experiment printed `done=NO` and I wrote "the difference is in the
+transfer, not in initialisation". That was wrong, and wrong for a reason worth
+recording: it polled the STOP command's `command_done`, which **never sets after a
+NACK aborts the FSM**. The register it should have read was `int_raw`, which held
+
+```
+0x00008692 = NACK | TRANS_START | TRANS_COMPLETE | DET_START | BYTE_TRANS_DONE
+```
+
+- the bus had been driven all along. Completion is now tested as
+`trans_complete || end_detect`, not as the last command's done bit.
+
+### The lesson
+
+**A fix applied in one place, with the original code left in place below it, looks
+exactly like a fix that does not work.** Both versions were written by the same
+hand, one round apart, and the newer one was meant to win - but nothing in the
+language says so, and nothing warned.
+
+This is the second time in this port that leftover code beat a correct fix (the
+`-u` anchor was the first, twelve times over). The check that would have caught
+it: after rewriting a function, **read it back and look for two assignments to the
+same register.**
+
+### What this proves and does not
+
+Proven: the LP I2C controller is clocked, reachable, drives SDA/SCL, clocks nine
+bits, samples the acknowledge, and reports NACK through its own interrupt status.
+
+**Not proven: a successful data transfer.** There is no I2C slave on this board, so
+a NACK from a reserved address is the strongest result available - it exercises
+everything except the byte stream and the ACK path in the other direction.
+
+Also not yet done: LP UART. It uses the same pad-configuration path that was wrong
+here, so it is worth writing now that the path is known to work.
+
 ## 18. Both bands, measured separately
 
 
