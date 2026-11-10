@@ -2811,6 +2811,144 @@ before the crash, but the crash is not acceptable.
 **Status: LP I2C is not working, the fault is in this port's driver, six candidate
 causes are eliminated, and the next one to test is named.**
 
+## 17z. Round 37: the FreeRTOS shim's semaphore bug, and five more LP I2C non-causes
+
+### The shim bug is real and fixed
+
+`i2c_del_master_bus()` panicked with:
+
+```
+assert failed: vSemaphoreDeleteWithCaps idf_additions.c:347 (xResult == ( ( BaseType_t ) 1 ))
+```
+
+The cause is in this port, not in IDF. `vSemaphoreDeleteWithCaps()` calls
+`xSemaphoreGetStaticBuffer()`, whose macro passes **NULL** for the storage
+pointer:
+
+```c
+#define xSemaphoreGetStaticBuffer( xSemaphore, ppxSemaphoreBuffer )
+    xQueueGenericGetStaticBuffers( ( QueueHandle_t ) ( xSemaphore ),
+                                   NULL,
+                                   ( ppxSemaphoreBuffer ) )
+```
+
+Upstream FreeRTOS accepts that - `queue.c:468-509` checks
+`if (ppucQueueStorage != NULL)` before writing, and the corresponding
+`configASSERT` only requires `ppxStaticQueue`. The shim's implementation rejected
+the call outright:
+
+```c
+if (xQueue == NULL || ppucQueueStorage == NULL || ppxStaticQueue == NULL)
+    return pdFALSE;
+```
+
+so **every** `vSemaphoreDeleteWithCaps()` returned `pdFALSE` and hit the assert.
+Any IDF driver that deletes a semaphore would have crashed. Fixed by accepting a
+NULL storage pointer and filling only what was given, which is what upstream
+does.
+
+Verified: `c5lpi2cidf` now finishes and prints its PASS line instead of rebooting.
+
+### Five more LP I2C differences eliminated
+
+Continuing from §17y's six:
+
+| difference | result |
+|---|---|
+| `esp_clk_tree_enable_src(XTAL_D2)` never called - only the source was *selected* | added (`-> 0x0`), **still fails** |
+| pads configured with raw `rtcio_ll_*` instead of `rtc_gpio_init` + `rtc_gpio_set_direction(INPUT_OUTPUT_OD)` | replaced with IDF's sequence, **still fails** |
+| `i2c_ll_disable_intr_mask(0xFFFFFFFF)` | added, **still fails** |
+| `i2c_ll_master_set_filter(0)` | added, **still fails** |
+| a hybrid run: let IDF configure the bus, then issue the commands by hand | IDF's transfer had already moved the bus (`int_raw=0x8692`), so the hybrid could not isolate configuration from start |
+
+Eleven differences now. After all of them the port's own driver still produces
+`int_raw=0x00000000` with every `command_done` clear.
+
+### The one difference that is left, and it is structural
+
+**IDF's I2C master is interrupt-driven; this port's driver polls.**
+
+```c
+/* i2c_master.c:713, inside the transfer */
+i2c_ll_enable_intr_mask(hal->dev, I2C_LL_MASTER_EVENT_INTR);
+/* i2c_master.c:1157 */
+esp_intr_alloc_intrstatus(..., I2C_LL_MASTER_EVENT_INTR, i2c_master_isr_handler_default, ...);
+```
+
+Every other difference was a value or an ordering. This one is a different
+execution model: IDF arms the mask, starts the transfer, and lets the ISR push the
+command FSM along. `lp_i2c.c` starts the transfer and spins on
+`command[idx].command_done`.
+
+On the HP controller both work - the existing `i2c0` driver in this port polls and
+passes. On the LP controller the FSM may simply never advance without the
+interrupt path servicing it, which would explain every observation including the
+empty `int_raw`: the events that would drive it are exactly the ones being
+suppressed.
+
+**That is a hypothesis with a mechanism, and it is testable in one round** -
+enable the mask, install a handler, and see whether the FSM moves. It is listed
+here rather than acted on because this round had already produced one real fix
+and it is better to leave with a clean, verified state than to start a
+restructuring at the end.
+
+**Status: LP I2C is not working. Eleven candidate causes eliminated, one
+structural difference identified, and the next experiment named.**
+
+## 17aa. Round 38: PARLIO and the DMA test were sharing a channel
+
+`c5parlio` passed on its own and failed when run after `c5dma` in the same boot -
+88 of 128 bits transferred, `dma_txint=0x1` (TX_DONE) while PARLIO's own status
+stayed empty. The reverse order was fine.
+
+Both drivers used **GDMA TX channel 0**. Every cleanup I tried made it worse or
+changed the number without fixing it:
+
+| attempt | result |
+|---|---|
+| `c5dma` disconnects the channel on exit | still failed, 88 bits |
+| `c5parlio` disconnects and resets before configuring | still failed, 88 bits |
+| `c5parlio` sets `owner_check(false)` explicitly | still failed, 97 bits |
+| `c5dma` disconnects **and resets both halves** on exit | still failed, 88 bits |
+| burst sized to the frame instead of a fixed 32 | still failed, 88 bits |
+
+None of them worked, and the reason is worth stating plainly: **two drivers taking
+turns on one channel have to agree on every field, and there is no way to prove
+they do.** Each cleanup I added covered the fields I happened to think of.
+
+The C5 has **three** channel pairs (`GDMA_LL_AHB_PAIRS_PER_GROUP` is 3). They did
+not have to share.
+
+```
+#define C5_GDMA_TX_CH          0    /* the M2M self test */
+#define C5_PARLIO_GDMA_TX_CH   1    /* PARLIO, its own */
+```
+
+Both orders now pass, and `c5parlio` twice in a row passes:
+
+```
+c5parlio: PASS ...
+c5dma   : PASS ...
+c5parlio: PASS ...
+```
+
+### The lesson, which is not "reset harder"
+
+The five failed attempts were all the same idea - make the cleanup more thorough.
+The fix was to **remove the sharing**, which is a different class of change. A
+shared resource with per-caller configuration is a bug that cleanup cannot fix,
+only hide; the give-away was that the failure moved (88 → 97 bits) without ever
+passing, which means each attempt was changing *some* relevant field and never all
+of them.
+
+Also worth recording: `c5gdma` alone never broke PARLIO - only `c5dma` did. The
+difference between them is that `c5dma` goes through PSRAM and enables the cache
+flush path, which is a *timing* difference, not a configuration one. That is the
+kind of clue that invites another cleanup attempt; the channel split makes it
+irrelevant.
+
+**Status: both tests pass in any order.** No change to what either proves.
+
 ## 18. Both bands, measured separately
 
 
