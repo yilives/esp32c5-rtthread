@@ -3269,6 +3269,89 @@ and defects that need a second, different command to have run first. The
 interleaved `c5can`/`c5twai` run covers the second case for one pair; the rest of
 the pairs are not covered.
 
+## 17af. Round 48-56: the Wi-Fi re-join crash, and four layers under it
+
+`c5join5` worked once per boot and crashed on the second call. Four independent
+causes, each of which alone produced a failure, and each of which had to be fixed
+before the next one became visible.
+
+| layer | cause | symptom |
+|---|---|---|
+| 1 | `esp_netif_create_default_wifi_sta()` called again | **assert panic**, board reboots |
+| 2 | `esp_wifi_init()` guarded with the documented `ESP_ERR_WIFI_INIT_STATE` (0x3013) but the observed code is `ESP_ERR_INVALID_STATE` (0x103) | re-join refused, gracefully |
+| 3 | `esp_wifi_connect()` returns 0 and does nothing when already associated | 30 s timeout, reports "down" |
+| 4 | **`FT_IRAM` expanded to nothing on RISC-V** | `Guru Meditation Error: panic'ed (Cache error)` |
+
+### Layer 4, which is the interesting one
+
+```c
+#if defined(__XTENSA__)
+#  define FT_IRAM    __attribute__((section(".iram1")))
+#else
+#  define FT_IRAM                              /* empty */
+#endif
+```
+
+The comment justifying the `#else` said the cache "is not shared with flash the
+same way" on non-Xtensa targets. **The ESP32-C5 is RISC-V and has exactly the same
+flash cache.** The guard did not prevent the resets it was written for - it
+excluded every RISC-V target from the protection. The comment above it already
+recorded two earlier cache-error resets on this path.
+
+Measured:
+
+```
+MEPC = 0x4206f21e  ft_ipc_resolve            (flash)
+RA   = 0x408095bc  xQueueGenericSendFromISR  (IRAM)
+```
+
+One side of the same call in IRAM, the other in flash. Wi-Fi writes NVS while
+associating, which disables the flash cache; if an interrupt lands in that window,
+the jump into flash is fatal - intermittently, which is why it took so long.
+
+Fixing it needed both halves:
+
+* `FT_IRAM` unconditional in `ft_core.h`, **and** on `ft_ipc_ptr_plausible` -
+  which `ft_ipc_resolve` itself calls, and which the previous round's diagnostics
+  had added, putting a new flash call inside the ISR path;
+* the kernel side, via `linker.lf`: `object` (whole), `rt_thread_resume`,
+  `rt_thread_suspend`, `rt_schedule`, `rt_schedule_insert_thread`,
+  `rt_schedule_remove_thread`, `rt_critical_level`, `rt_enter_critical`,
+  `rt_exit_critical`.
+
+`linker.lf` already placed the **trap** path in IRAM for the same reason. The
+FreeRTOS shim's ISR path was simply a different way into the kernel that it did
+not cover.
+
+Cost: `_iram_end` 0x4081e080 -> 0x4081ed80, **3.8 KB**, with 79.3 KB still free
+before `__heap_start__`.
+
+Verified with `nm`, every function on the path in IRAM:
+
+```
+40809692 ft_ipc_resolve     4081bf4c rt_sem_trytake    4081ca90 rt_schedule
+408096dc ft_ipc_send_isr    4081bf5c rt_sem_release     4081cc4e rt_thread_resume
+4081b604 rt_spin_lock_irqsave  4081c7bc rt_object_get_type
+```
+
+### Two rounds were spent on the wrong cause
+
+The panic dump's `MEPC` was inside `ft_ipc_resolve`'s prologue - a `void`
+function that dereferences nothing. The value `0x40860000` in the argument
+registers was read as "a bad handle caused this", and two rounds went into a
+range check for it, including two wrong sets of bounds:
+
+* a hand-picked `0x3C000000..0x41000000` (80 MB) - **admitted** the very address
+  it was written to reject;
+* `__heap_end__` (0x40841ba0) as the ceiling - **rejected a legitimate** IDF queue
+  handle at 0x4085ce9c, because IDF's own statics live above this port's heap;
+* `0x40800000..0x40860000`, upper bound **exclusive** - accepts one, rejects the
+  other.
+
+The register contents after a cache fault carried no meaning. **The bad handle was
+a symptom, not the cause**, and the thing that settled it was cheap: `nm` showed
+one side of the call in IRAM and the other in flash.
+
 ## 18. Both bands, measured separately
 
 
