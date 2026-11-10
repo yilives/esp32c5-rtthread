@@ -3198,6 +3198,77 @@ The verification is now five consecutive runs plus interleaving with `c5twai`:
 c5can PASS, c5can PASS, c5twai PASS (4 rates), c5can PASS, c5twai PASS, c5can PASS
 ```
 
+## 17ae. Round 42: every command run twice
+
+The CAN bug in §17ad was a *repeatability* defect - the driver worked once
+per boot and nothing noticed, because every self test ran exactly once. So the
+obvious follow-up is to run every command twice and see what else only works the
+first time.
+
+One more turned up.
+
+### `c5spiloop`: the second run could not register a device that already existed
+
+```
+c5spiloop -> PASS, loopback identical
+c5spiloop -> attach to spi0 failed
+```
+
+`rt_spi_bus_attach_device()` ends in `rt_spidev_device_init()` ->
+`rt_device_register(device, "spiloop", ...)` (`dev_spi.c:164`), and the object
+manager refuses a duplicate name. The `struct rt_spi_device` is `static`, so it
+survives between invocations and is *already* the registered device - the second
+attach was being asked to create something that existed and was correct.
+
+Fixed by looking the device up first and reusing it:
+
+```c
+rt_device_t existing = rt_device_find("spiloop");
+if (existing != RT_NULL) { dev = (struct rt_spi_device *)existing; }
+else if (rt_spi_bus_attach_device(&loop_dev, "spiloop", bus_name, RT_NULL) == RT_EOK) { ... }
+```
+
+**A test that can only pass once is not testing the driver, it is testing the
+first call.**
+
+### What the sweep found and did not
+
+Every other command was run twice, in one boot, in sequence:
+
+| command | twice |
+|---|---|
+| `c5rmt` | PASS, PASS |
+| `c5spiloop` | PASS, PASS (after the fix) |
+| `c5pcnt` | PASS, PASS |
+| `c5mcpwm 1000 500` | PASS, PASS |
+| `c5tsens 16` | PASS, PASS |
+| `c5adc` | PASS, PASS |
+| `c5dma` | PASS, PASS |
+| `c5parlio` | PASS, PASS |
+| `c5usj` | PASS, PASS |
+| `c5heap` | PASS, PASS |
+| `c5psram test 64` | PASS, PASS |
+| `c5ulp` | PASS, PASS |
+| `c5lpi2c` | PASS, PASS |
+| `c5lpuart 115200` | PASS, PASS |
+| `c5can` | PASS x5, interleaved with `c5twai` |
+
+Two repeatability defects in the whole port: the CAN device class (§17ad) and
+this one. Both were invisible to a single-run test suite, and both were found by
+changing the *number* of runs rather than the contents of any test.
+
+### The general point
+
+A self-test that leaves the hardware or the object tree in a state it cannot
+recover from is passing on the strength of a clean start, not on the strength of
+the driver. **`rt_device_register()` on a name that is already there is the
+cheapest way to detect that**, because it fails loudly.
+
+The one thing this sweep cannot find: defects that require a *reboot* to appear,
+and defects that need a second, different command to have run first. The
+interleaved `c5can`/`c5twai` run covers the second case for one pair; the rest of
+the pairs are not covered.
+
 ## 18. Both bands, measured separately
 
 
