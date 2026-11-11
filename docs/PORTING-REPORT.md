@@ -3422,9 +3422,13 @@ tcp     : received 12 byte(s): pong-from-pc     x3, no FAIL
 Nothing in the port was changed to fix this, because nothing in the port was
 wrong. The durable output is `tools/tcpecho_loop.py` and the note above.
 
-## 17ah. An open issue: `Invalid mbox` after a TCP session, not root-caused
+## 17ah. `Invalid mbox` after repeated joins - six layers of IRAM, resolved
 
-**This is recorded as OPEN, not fixed.** Writing it up as resolved would be false.
+**Resolved in §17ai.** The section below is kept as written at the time - it
+documents a chain of wrong attributions that is worth more than the fix.
+
+**Originally recorded as OPEN, not fixed.** Writing it up as resolved would have been
+false at that point.
 
 ### What was observed
 
@@ -3481,6 +3485,67 @@ round and left a misleading note in this report.
   condition is literally `tcpip_mbox == NULL`;
 * if it reproduces, the next instrument is an RTC-noinit record written at the
   assert site - it survives the panic reboot, which .bss does not.
+
+## 17ai. Round 48-54: the same fault six times, and why it looked random
+
+The `Invalid mbox` crashes in §17ah were **IRAM code calling flash code**, the same
+class as §17z - and it took six layers to reach the bottom, because each fix
+moved the crash to the next function:
+
+| # | `MEPC` (flash) | | fixed by |
+|---|---|---|---|
+| 1 | `0x4206f21e` `ft_ipc_resolve` | | `FT_IRAM` unconditional (`ft_core.h`) |
+| 2 | `0x4200d506` `rt_sem_trytake` | | `ipc (noflash)` |
+| 3 | `0x42000dfa` `rt_object_get_type` | | `object (noflash)` |
+| 4 | `0x4206de8c` `ft_ipc_push` | | `ft_ipc (noflash)` |
+| 5 | `0x420011ae` `rt_memcpy` | | `kstring (noflash)` |
+| 6 | `0x4206dbb6` `ft_qset_signal` | | `ft_qset`, `ft_event`, `ft_notify`, `ft_task` |
+
+**That is why it looked intermittent: the crash site moved every time, so each
+observation named a different function and every hypothesis fit one round.**
+
+What finally identified it was not a hypothesis but a coordinate: `MEPC` in
+`0x420xxxxx` (flash) while `RA` was in `0x4080xxxx` (IRAM). *One side of the same
+call in each region* is the signature, and it is visible in every panic dump that
+was already captured - `nm` over the two addresses takes seconds.
+
+### Whole objects, not per-function attributes
+
+The entry points had `FT_IRAM` from the first fix. Their static helpers in the
+same file did not: `ft_ipc_push`, `ft_ipc_pop`, `ft_qset_signal`. A file whose
+entry points are ISR-callable has to be placed as a unit.
+
+```
+_iram_end      = 0x40820b00   (130.8 KB)
+__heap_start__ = 0x40834b70   (79.2 KB still free between them)
+```
+
+### Six joins, all `GOT_IP`
+
+```
+join 1 : GOT_IP    join 4 : GOT_IP
+join 2 : GOT_IP    join 5 : GOT_IP
+join 3 : GOT_IP    join 6 : GOT_IP
+```
+
+### What this is not
+
+**Not proof that a seventh layer does not exist.** Six joins pass and 79 KB of
+IRAM remain, but the headroom is finite and the approach does not scale: the
+kernel is roughly 105 KB of text.
+
+The structural fix is an ISR path that does not call the kernel at all -
+FreeRTOS's `FromISR` contract is lightweight and non-blocking by design, and this
+shim forwards to a locking kernel instead. That is a redesign of `ft_ipc_send_isr`
+and `ft_qset`, not another line in `linker.lf`.
+
+### The cost of getting here
+
+Six wrong attributions in this investigation - test procedure (§17ag), then
+BLE initialisation, then memory corruption, then an init race - each cost a round
+and each left a note that had to be retracted. **The fault never changed; only the
+address did.** A panic dump already contained the answer, and nobody read the two
+addresses side by side until round 54.
 
 ## 18. Both bands, measured separately
 
