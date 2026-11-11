@@ -3352,6 +3352,76 @@ The register contents after a cache fault carried no meaning. **The bad handle w
 a symptom, not the cause**, and the thing that settled it was cheap: `nm` showed
 one side of the call in IRAM and the other in flash.
 
+## 17ag. Rounds 47-56: TCP was never broken - my test procedure was
+
+`c5tcp` passed once early on and then appeared to fail intermittently with
+
+```
+assert failed: tcpip_send_msg_wait_sem tcpip.c:454 (Invalid mbox)
+```
+
+Ten rounds went into that assertion. It is **not a port defect**. Three
+independent mistakes in how the test was invoked produced every observation, and
+each one alone is enough to explain the "intermittency".
+
+### Mistake 1: the assert reboots the board, and the next command did not re-join
+
+`tcpip_mbox` is created by `tcpip_init()`, which runs inside
+`esp_netif_init()`. A socket call before that is a NULL mbox and asserts - which
+panics and reboots. The next invocation then ran `c5tcp` **without** `c5join5`,
+so it asserted again. A guaranteed failure was read as an intermittent one.
+
+Evidence that settled it, taken at the decision site rather than afterwards:
+
+```
+netif   : tcpip_initialized=0 init_count=0     <- before: not initialised
+wifi    : GOT_IP, associated 10.0.0.195
+c5tcpip: tcpip_init ran 1 time(s) this boot    <- after: ran once, mbox valid
+```
+
+### Mistake 2: the echo server accepted exactly one connection
+
+`tcpecho.py` accepts, replies, and exits. Three consecutive `c5tcp` runs
+therefore had the first answered and the next two refused - `errno=104`
+(ECONNRESET), which looks exactly like a device problem. `tcpecho_loop.py` was
+written for this: it accepts repeatedly.
+
+### Mistake 3: the reply string is checked
+
+`c5_tcp` compares the reply against `"pong-from-pc"` (`wifi.c:621`). A server
+configured to answer `"pong"` gave
+
+```
+tcp     : received 4 byte(s): pong
+tcp     : FAIL, reply is not the expected one
+```
+
+Data path fine, comparison failed. Worth keeping - a zero-length read is also a
+"success" otherwise.
+
+### The result when all three are right
+
+```
+wifi    : GOT_IP, associated 10.0.0.195
+tcp     : connected to 10.0.0.159:3334
+tcp     : sent 12 byte(s)
+tcp     : received 12 byte(s): pong-from-pc     x3, no FAIL
+```
+
+### Two lessons, both about measurement rather than code
+
+1. **When a fault is intermittent, check whether the TEST is intermittent first.**
+   Three procedure errors each explained the observations perfectly, and the cost
+   of attributing them to the device was ten rounds.
+2. **A reading taken after a reboot is not a reading of the same state.** One
+   `c5tcpip` invocation reported `init_count=0, mbox=NULL` and was taken as proof
+   that initialisation had been skipped; the board had simply rebooted and WiFi
+   had never come up. The observation has to sit on the causal path - printing
+   inside `esp_netif_init` is what showed the healthy `0 -> 1` sequence.
+
+Nothing in the port was changed to fix this, because nothing in the port was
+wrong. The durable output is `tools/tcpecho_loop.py` and the note above.
+
 ## 18. Both bands, measured separately
 
 
