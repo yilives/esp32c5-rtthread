@@ -3768,6 +3768,36 @@ Worse, the same class of bug had already been found and fixed once - `tcpecho.py
 also accepted a single connection, fixed in §17ag. The lesson was written down
 and then not applied to the second tool with the same shape.
 
+## 17am. Both bands, measured with the looping sink
+
+Same method as §17al - `tcpsink_loop.py`, three runs inside one boot each:
+
+| band / condition | three runs (kbit/s) | median |
+|---|---|---|
+| 5 GHz, ch36/44, rssi -51..-61 | 23970 / 23736 / 24115 | **~23.9 Mbit/s** |
+| 2.4 GHz, ch1, rssi -54 | 22748 / 23501 / 23572 | **~23.5 Mbit/s** |
+| 5 GHz + BLE connected, subscribed | 23569 / 23252 / 23583 | **~23.5 Mbit/s** |
+
+All three land within 2% of each other.
+
+### What that does and does not mean
+
+**Does:** both bands sustain ~23.5 Mbit/s, repeatably; a live BLE connection
+costs about 2%; the figure is stable to +-2% run to run.
+
+**Does not:** this is not an RF ceiling measurement. 2.4 GHz (40 MHz, 802.11n) and
+5 GHz (80 MHz, 802.11ac) have very different theoretical maxima, yet both read
+~23.5 Mbit/s - so **the board is the bottleneck, not the air**. That is consistent
+with the earlier finding that throughput moved 50x (327 kbit/s -> 19 Mbit/s) after
+a shim/lwIP fix, with no RF change at all.
+
+To measure band differences properly the sender has to be pushed harder than this
+board pushes it - a larger TCP window, or the board as receiver.
+
+**So the honest sentence is "about 23.5 Mbit/s in both bands", not "5 GHz is no
+faster than 2.4 GHz".** The second would be a claim about the radio; the data only
+supports a claim about this end of the link.
+
 ## 18. Both bands, measured separately
 
 
