@@ -50,7 +50,7 @@ pinirq  : PASS
 | Wi-Fi scan | PASS, 24-33 APs per run | §8.2 |
 | Wi-Fi associate + DHCP | PASS | §8.2 |
 | TCP round trip, both directions | PASS | §19 |
-| TCP sustained send, 32 KB window | **19213 kbit/s** (5 GHz), **10426 kbit/s** (2.4 GHz) | §15.1 |
+| TCP sustained send, 32 KB window | **~24000 kbit/s** (5 GHz, repeatable +-2%; the older 19213 figure came from a single-connection sink, see §17al) | §15.1, §17al |
 | TCP sustained receive | **10399 kbit/s** (5 GHz), **2077 kbit/s** (2.4 GHz) | §18.2, §15.1 |
 | BLE advertising | PASS, witnessed by an external radio | §8.3 |
 | BLE GATT connect / read / notify | PASS, 7 notifications, link held 40 s with 0 drops | §9.1, §19 |
@@ -3709,6 +3709,64 @@ the sixth, and the ninth attempt would have come twenty rounds sooner.
   prompt, the prompt test matched a leftover prompt, and the idle fallback was
   shorter than a Wi-Fi scan. Every one of them produced a plausible-looking
   measurement that was wrong.
+
+## 17al. The throughput numbers were wrong: a single-connection sink
+
+Every sustained-throughput figure in this report up to §17ak was measured against
+`tools/tcpsink.py`, which accepts **one** connection and exits. Repeated runs in
+one boot therefore measured the first connection honestly and then produced
+nonsense:
+
+```
+tput : 12053152 bytes in 4000 ms = 24106 kbit/s, 1030 window stall(s)
+tput :   169152 bytes in 4000 ms =   338 kbit/s, 3968 window stall(s)   <- no reader
+```
+
+3968 "window stalls" is the sender blocked on a receive window nobody is
+draining. That 338 kbit/s was nearly written up as "Wi-Fi throughput is
+unstable".
+
+### What the numbers actually are
+
+`tcpsink_loop.py` drains every connection. Same boot, three runs:
+
+```
+23970 kbit/s, 1058 stalls
+23736 kbit/s, 1111 stalls
+24115 kbit/s, 1036 stalls
+```
+
+**~24.0 Mbit/s, repeatability +-2%.** Not "13-21 Mbit/s, varying by 60%".
+
+### BLE coexistence, measured properly
+
+With `ble : connected handle=0` on the board and a PC-side GATT client
+subscribed to notifications:
+
+```
+23569 / 23252 / 23583 kbit/s   ->  ~23.5 Mbit/s
+```
+
+**About 2% below the no-BLE baseline**, not the 10-40% that an earlier polluted
+comparison suggested. This is what a time-sliced coexistence arbiter should look
+like: a BLE connection event occupies a few hundred microseconds of a slot, which
+barely registers against a saturated 24 Mbit/s stream.
+
+### Three figures in this report were wrong because of it
+
+| written earlier | actually |
+|---|---|
+| 13-21 Mbit/s, "baseline varies 60%" | ~24.0 Mbit/s, +-2% |
+| BLE coexistence 12.3 Mbit/s, "10-40% lower" | ~23.5 Mbit/s, ~2% lower |
+| "cannot quantify coexistence cost" | can: ~2% |
+
+**The mistake was not the arithmetic, it was using a tool whose behaviour changes
+with the number of connections while comparing measurements taken across
+different boots.** Every comparison looked self-consistent.
+
+Worse, the same class of bug had already been found and fixed once - `tcpecho.py`
+also accepted a single connection, fixed in §17ag. The lesson was written down
+and then not applied to the second tool with the same shape.
 
 ## 18. Both bands, measured separately
 
