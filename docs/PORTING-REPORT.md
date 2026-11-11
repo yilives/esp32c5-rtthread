@@ -3547,6 +3547,99 @@ and each left a note that had to be retracted. **The fault never changed; only t
 address did.** A panic dump already contained the answer, and nobody read the two
 addresses side by side until round 54.
 
+## 17aj. The repeated-join crash: what was tried, and why the approach was wrong
+
+`c5join5` four times in one boot aborts with
+
+```
+RT-Thread scheduler entry while flash cache is disabled
+```
+
+The message comes from `prvAssertCacheEnabled()` in the FreeRTOS RISC-V port
+(`portable/riscv/port.c:562,572`) - a guard this port already had. It fires
+because `rt_schedule()` is reached while the Wi-Fi driver is writing NVS with the
+flash cache disabled.
+
+### Seven things were tried. The first six moved the fault; the seventh changed nothing.
+
+| # | attempt | result |
+|---|---|---|
+| 1-6 | moving shim and kernel objects into IRAM, one crash address at a time (`ft_ipc_resolve`, `rt_sem_trytake`, `rt_object_get_type`, `ft_ipc_push`, `rt_memcpy`, `ft_qset_signal`) | each fix moved the crash to the next function; never eliminated |
+| 7 | `rt_interrupt_enter()` / `rt_interrupt_leave()` around `ft_ipc_send_isr` | **no effect** - `MEPC` shifted by exactly the 24 bytes of the added call and the same assert fired |
+
+Attempt 7 was the one that looked certain: `rt_schedule()` gates on
+`interrupt_nest == 0` (`scheduler_up.c:357`), the shim never incremented that
+counter, so it was switching contexts inside an IDF ISR. Adding the enter/leave
+pair makes `nest` non-zero... and it does not help, because of **where the gate
+sits**:
+
+```c
+void rt_schedule(void)
+{
+    level = rt_hw_interrupt_disable();
+    curr_thread = rt_thread_self();      /* <-- rt_thread_self() FIRST, in flash */
+    if (rt_scheduler_lock_nest == 0) { ... }
+```
+
+`rt_thread_self()` is called before any check, and it is flash code. The same
+argument kills `rt_enter_critical()` as a workaround: `rt_schedule()` reads
+`rt_tick_get`/`rt_thread_self` before it looks at `rt_scheduler_lock_nest`.
+
+### The structural conclusion
+
+**`rt_sem_release()` cannot be called from an IDF ISR on this port.** Not because
+of one missing symbol, but because the whole path it walks - `rt_thread_self`,
+`rt_object_get_type`, the suspend-list operations, `rt_schedule` - is spread over
+translation units that do not fit in IRAM alongside everything else:
+
+```
+IRAM in use      130.8 KB
+IRAM still free   79.2 KB  (to __heap_start__)
+rt-thread text   ~105 KB
+```
+
+Moving the kernel in is not possible; moving enough of it to make one call safe
+leaves the next call unsafe, which is what six rounds of "just one more object"
+demonstrated.
+
+### What the correct fix looks like
+
+`ft_ipc_send_isr` must do **no kernel call at all**:
+
+* take a spinlock that is IRAM-resident,
+* append to the ring,
+* set `*woken = ftPASS` if a thread was waiting,
+* return.
+
+The wake-up then happens from a context where the cache is guaranteed on - either
+the caller (FreeRTOS's `portYIELD_FROM_ISR` path) or a deferred hook. This is a
+redesign of `ft_ipc.c`, `ft_qset.c` and `ft_event.c` together, because they share
+the `ft_ipc` object, and it changes the meaning of `woken` from "I scheduled" to
+"I recorded a wake".
+
+### State of the image as delivered
+
+| scenario | result |
+|---|---|
+| single `c5join5` | `GOT_IP`, repeatedly - stable |
+| `c5join5` + `c5tcp` round trip | works, 12 bytes out and back |
+| `c5join5` + `c5iperf 5 s` | 13-21 Mbit/s |
+| **four `c5join5` in one boot** | **aborts** (the guard above) |
+| ten `c5join5`, one call each, fresh boot | `GOT_IP` every time |
+
+So the port is usable, and re-joining a network repeatedly is the specific
+pattern that is not.
+
+### What this cost, and the one thing that would have saved it
+
+Attempts 1-6 each looked like progress because the crash address changed. Nothing
+in the panic dumps was missing: the guard's own message names the condition, and
+`MEPC`/`RA` naming different regions is visible in the first dump that was ever
+captured. **The instruction to read was in the output the whole time.** What was
+missing was the decision to stop patching and ask whether the *category* of fix
+could work at all - which is a judgement, not a datum, and it should have come
+after the second moved crash, not the seventh.
+
 ## 18. Both bands, measured separately
 
 
