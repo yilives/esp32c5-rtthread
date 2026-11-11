@@ -3422,6 +3422,66 @@ tcp     : received 12 byte(s): pong-from-pc     x3, no FAIL
 Nothing in the port was changed to fix this, because nothing in the port was
 wrong. The durable output is `tools/tcpecho_loop.py` and the note above.
 
+## 17ah. An open issue: `Invalid mbox` after a TCP session, not root-caused
+
+**This is recorded as OPEN, not fixed.** Writing it up as resolved would be false.
+
+### What was observed
+
+Twice, `c5all` asserted partway through when it was preceded by a TCP throughput
+test in the same boot:
+
+```
+tput    : 20174 bytes ... 15286 kbit/s
+--- c5all (hold 60 s) ---
+assert failed: tcpip_send_msg_wait_sem tcpip.c:518 (Invalid mbox)
+```
+
+and once with `step1` never printed, placing the fault inside `c5_ble_init()`.
+
+### What was ruled out, with evidence
+
+| hypothesis | how it was refuted |
+|---|---|
+| `tcpip_init()` never ran | `netif : tcpip_initialized=0 init_count=0` then `GOT_IP`, and a later read showed `init_count=1, mbox=0x4085ce9c` |
+| `c5_ble_init()` touches lwIP | after BLE sync, the trace still read `tcpip_initialized=0` |
+| `sys_mbox_new()` failed | instrumented: never printed, and the mbox was non-NULL when read |
+| the fault is in `nimble_port_init()` | step markers showed it returned `rc=0` |
+| a stale echo/sink on the host | replaced with `tcpecho_loop.py`, confirmed listening before each run |
+| buffered output hiding lines | full unfiltered capture |
+
+### What the last full run showed
+
+The identical sequence **succeeded**:
+
+```
+c5join5    -> GOT_IP
+c5iperf 3s -> 21418 kbit/s
+c5all      -> step1/2/3 all 0, PASS, still alive after 60 s
+```
+
+So the trigger is not "a TCP session before `c5all`" as such.
+
+### Why this stopped being chased
+
+Six successive conclusions in this investigation were overturned by the next
+measurement - see §17ag for the first three, which were all test-procedure
+artefacts. Continuing to guess has negative value: each wrong hypothesis cost a
+round and left a misleading note in this report.
+
+### Where to start next time
+
+* capture **unfiltered** output to a file first; `Select-String` dropped the
+  decisive `tput` line once already;
+* confirm the board has **not rebooted** since the command that set it up - a
+  reading taken after a reboot is a reading of a different state;
+* `tcpecho_loop.py`, not `tcpecho.py`, and the reply must be `pong-from-pc`;
+* the assert is `sys_mbox_valid_val(tcpip_mbox)` in the
+  `!LWIP_TCPIP_CORE_LOCKING` branch, and `sys_mbox_t` here is a pointer, so the
+  condition is literally `tcpip_mbox == NULL`;
+* if it reproduces, the next instrument is an RTC-noinit record written at the
+  assert site - it survives the panic reboot, which .bss does not.
+
 ## 18. Both bands, measured separately
 
 
