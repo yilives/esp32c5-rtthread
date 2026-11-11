@@ -3640,6 +3640,76 @@ missing was the decision to stop patching and ask whether the *category* of fix
 could work at all - which is a judgement, not a datum, and it should have come
 after the second moved crash, not the seventh.
 
+## 17ak. Round 81: the fix was to not call it at all
+
+`prvAssertCacheEnabled("RT-Thread scheduler entry while flash cache is disabled")`
+came from `vPortYieldFromISR()` (`portable/riscv/port.c`). Nine attempts:
+
+| # | attempt | outcome |
+|---|---|---|
+| 1-6 | move shim and kernel objects into IRAM, one crash address at a time | each moved the crash to the next function |
+| 7 | `rt_interrupt_enter/leave` around `ft_ipc_send_isr` | no effect - `MEPC` shifted by exactly the 24 bytes of the added call |
+| 8 | `CONFIG_BT_CTRL_RUN_IN_FLASH_ONLY` | no effect - the fault is in the **Wi-Fi** ISR, and that option only changes what the BLE controller requests |
+| 9 | **do not call `rt_schedule()` when the cache is off** | **fixed** |
+
+### The fix
+
+```c
+if (cache_hal_is_cache_enabled(CACHE_LL_LEVEL_EXT_MEM, CACHE_TYPE_ALL)) {
+    rt_schedule();
+}
+/* else: return without scheduling */
+```
+
+The yield is an **optimisation**: by the time any ISR reaches `vPortYieldFromISR`,
+the woken thread is already in the ready queue, and RT-Thread's 1 kHz tick calls
+`rt_schedule()` on its own. Skipping one call delays the switch by at most 1 ms and
+loses nothing. Aborting takes the whole chip down.
+
+**The cost, stated plainly:** during a flash write (Wi-Fi writing NVS), a thread
+woken from an ISR runs up to **1 ms later** than it otherwise would. Invisible to
+throughput tests; it would matter to microsecond-latency work.
+
+### Verified with the boot counter, not a grepped error string
+
+Earlier attempts in this investigation were "confirmed" against criteria that were
+themselves broken (three times: a filtered `Cache error` string, a `tick`
+comparison across `c5seq` invocations - which resets the board itself - and a
+prompt test that matched a stale prompt). The criterion used now is the one that
+tells the truth: read `tick` at both ends of a **single** serial session; a reboot
+resets it.
+
+```
+four joins x3      : abort 0, panic 0, GOT_IP x4, tick 57405 (monotonic)
+six and eight joins: abort 0, panic 0
+c5all              : PASS
+BLE GATT from host : connected, 6 notifications, PASS
+full self-test     : 19 checks pass
+```
+
+### Why it took nine attempts
+
+Attempts 1-8 all asked **"how do I make `rt_schedule()` safe with the cache off"**.
+The workable question was **"why call it then"**.
+
+Attempts 1-6 each *looked* like progress because the faulting address moved - and
+that is exactly the signal to stop patching and question whether the category of
+fix can work at all. It should have been read after the second moved crash, not
+the sixth, and the ninth attempt would have come twenty rounds sooner.
+
+### Two errors inside this investigation worth their own line
+
+* enabling `CONFIG_SPI_FLASH_AUTO_SUSPEND` alongside
+  `BT_CTRL_RUN_IN_FLASH_ONLY` because IDF's help text recommended it, without
+  testing it alone, **boot-looped the board**
+  (`assert failed: __esp_sys_init_fn_init_flash`). Two independent options,
+  enabled as a pair, turned a performance question into an unbootable device;
+* `c5seq.py` needed three fixes of its own before it could measure anything: the
+  read loop slept for the full `--wait` per command rather than returning at the
+  prompt, the prompt test matched a leftover prompt, and the idle fallback was
+  shorter than a Wi-Fi scan. Every one of them produced a plausible-looking
+  measurement that was wrong.
+
 ## 18. Both bands, measured separately
 
 

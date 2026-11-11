@@ -16,6 +16,10 @@ import serial
 
 PROMPT = b"msh >"
 
+# Longest silence a command may produce before it is assumed finished.
+# Measured: a 5 GHz scan prints nothing for ~10 s, association for ~15 s.
+IDLE_LIMIT = 25.0
+
 
 def main() -> int:
     args = sys.argv[1:]
@@ -58,12 +62,44 @@ def main() -> int:
             sp.write((cmd + "\r\n").encode())
             sp.flush()
 
+            # RETURN WHEN THE PROMPT COMES BACK, not after a fixed delay.
+            #
+            # `--wait` used to be how long to read, in full, for every command:
+            #
+            #     deadline = time.time() + wait
+            #     while time.time() < deadline: out += sp.read(4096)
+            #
+            # So `--wait 700` with six commands took 4200 seconds regardless of
+            # what the commands did, and a four-join sequence looked hung for
+            # 20+ minutes with no output. It was not hung; it was sleeping.
+            #
+            # `--wait` is now an UPPER BOUND: reading stops as soon as the prompt
+            # reappears, which is the only signal that the command finished.
             out = bytearray()
             deadline = time.time() + wait
+            idle_since = time.time()
             while time.time() < deadline:
                 chunk = sp.read(4096)
                 if chunk:
                     out += chunk
+                    idle_since = time.time()
+                    # The prompt is printed after the command returns. Require it
+                    # to arrive after some output, so a stale prompt from the
+                    # previous command cannot end this one immediately.
+                    # The prompt must END what has arrived, not merely appear in
+                    # it. `PROMPT in out` matched the prompt left over from the
+                    # PREVIOUS command as soon as a few bytes of WiFi log had
+                    # arrived, so `c5join5` was cut off mid-connection - which
+                    # looked exactly like the board rebooting mid-sequence and
+                    # produced a false "join x4 restarts" reading.
+                    if out.rstrip().endswith(PROMPT):
+                        break
+                elif (time.time() - idle_since) > IDLE_LIMIT and len(out) > 0:
+                    # Fallback for a swallowed prompt. It has to be LONGER than
+                    # the quietest legitimate pause: a Wi-Fi scan prints nothing
+                    # for ~10 s, and at 3 s this cut `c5all` off after `set_ps`,
+                    # which reads exactly like a hang in the driver.
+                    break
 
             text = out.decode("utf-8", "replace").replace("\r", "")
             print("\n=== %s ===" % cmd)
