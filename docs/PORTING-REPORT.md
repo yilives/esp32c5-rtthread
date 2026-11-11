@@ -3798,6 +3798,77 @@ board pushes it - a larger TCP window, or the board as receiver.
 faster than 2.4 GHz".** The second would be a claim about the radio; the data only
 supports a claim about this end of the link.
 
+## 17an. The seventh layer, and the mixed-load run
+
+The deferred yield (§17ak) removed `rt_schedule()` from the ISR but not `rt_sem_release()`,
+which reaches flash on its own:
+
+```
+RA   = 0x4081d1be  rt_susp_list_dequeue   (ipc.c:120, IRAM)
+MEPC = 0x4200cb0c  rt_sched_thread_ready  (scheduler_comm.c:233, FLASH)
+```
+
+`ipc` was already in IRAM from layer 2; `scheduler_comm` is the file it calls next.
+Adding `scheduler_comm (noflash)` closes it:
+
+```
+4081d186 T rt_susp_list_dequeue
+4081e288 T rt_sched_thread_ready      <- now IRAM
+
+_iram_end      = 0x40820c00   (131.0 KB)
+__heap_start__ = 0x40834c30   (79.5 KB still free)
+```
+
+### The whole ladder
+
+| # | crash site (`MEPC`) | fix |
+|---|---|---|
+| 1 | `ft_ipc_resolve` | `FT_IRAM` unconditional |
+| 2 | `rt_sem_trytake` | `ipc (noflash)` |
+| 3 | `rt_object_get_type` | `object (noflash)` |
+| 4 | `ft_ipc_push` | `ft_ipc (noflash)` |
+| 5 | `rt_memcpy` | `kstring (noflash)` |
+| 6 | `ft_qset_signal` | `ft_qset`, `ft_event`, `ft_notify`, `ft_task` |
+| 7 | `rt_sched_thread_ready` | `scheduler_comm (noflash)` |
+
+Plus the one change that was not relocation: **do not call `rt_schedule()` when the
+flash cache is off** (§17ak).
+
+### Verification after layer 7
+
+```
+c5stat -> c5all 0 -> c5join5 x5 -> c5iperf x2 -> c5stat
+c5all PASS : 1
+GOT_IP     : 6
+Cache error / Guru : 0
+tick       : 73 -> 109906        (110 s continuous, no reset)
+```
+
+10 operations in one session, no fault, uptime monotonic.
+
+### The throughput in that run was 10.2 Mbit/s - and that is NOT a baseline
+
+```
+tput : 5085376 bytes in 4000 ms = 10170 kbit/s, 2623 window stall(s)
+tput : 5159616 bytes in 4000 ms = 10319 kbit/s, 2625 window stall(s)
+```
+
+That run had BLE advertising **and** five re-associations immediately before it;
+the clean baseline is ~23.5 Mbit/s with ~1100 stalls (§17al, §17am). Writing 10.2 up as "throughput
+with BLE advertising" would be the same mistake as §17al - a number whose
+conditions were never compared to a control. The run's value is that **nothing
+crashed under mixed load**, and that is the only claim made from it.
+
+### The stopping condition was stated, and was not reached
+
+Before making this change the condition was: *if an eighth layer appears, conclude
+that relocation cannot make this ISR path safe and document the limit instead.*
+
+No eighth layer appeared. **That is not proof of convergence.** IRAM has 79.5 KB
+left, `scheduler_comm` is a whole file whose own callees were not audited, and one
+good sequence is one sample. What can be said is that seven concrete faults were
+found, explained and closed, and the eighth is neither present nor excluded.
+
 ## 18. Both bands, measured separately
 
 
