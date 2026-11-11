@@ -3859,6 +3859,29 @@ with BLE advertising" would be the same mistake as §17al - a number whose
 conditions were never compared to a control. The run's value is that **nothing
 crashed under mixed load**, and that is the only claim made from it.
 
+### Stress evidence, all with the uptime criterion
+
+Three sequences, each inside ONE serial session so `tick` tells the truth:
+
+| sequence | result |
+|---|---|
+| `c5all` + `c5join5` x3 | 4x GOT_IP, 0 faults, tick 72 -> 66504 |
+| `c5all` + 5x join + 2x `c5iperf` | c5all PASS, 6x GOT_IP, 0 faults, tick 73 -> 109906 |
+| `c5all` + `c5join2`/`c5join5` alternating x8 | 9x GOT_IP, 0 faults, tick 73 -> 152545 |
+
+16 associations in total, across both bands, with BLE live, over 2.5 minutes of
+continuous uptime. **No eighth layer appeared in any of them.**
+
+The band-alternating sequence is the heavier one: each step leaves the current
+channel, scans, and re-associates, so it exercises the NVS write path that
+produced the original abort far more often than same-band re-joining.
+
+**What this supports:** the seven fixes plus the deferred yield hold under repeated
+re-association in both bands and with BLE active.
+**What it does not support:** convergence. Same caveat as above - 79.5 KB of IRAM
+remains, `scheduler_comm`'s callees are unaudited, and stress tests can only fail
+to find a fault, never prove its absence.
+
 ### The stopping condition was stated, and was not reached
 
 Before making this change the condition was: *if an eighth layer appears, conclude
